@@ -1,0 +1,5 @@
+{
+  "name": "Coastal Defense Simulation",
+  "description": "A dynamic simulation of coastal defense using VTOL drones for maritime patrol and target tracking.",
+  "requestFramePermissions": []
+}
