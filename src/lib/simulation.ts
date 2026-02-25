@@ -1,4 +1,5 @@
 export type TargetType = 'FRIENDLY' | 'ENEMY' | 'FISHING' | 'UNKNOWN';
+export type WeatherType = 'CLEAR' | 'FOG' | 'RAIN' | 'STORM';
 
 export interface Vector2D {
   x: number;
@@ -24,8 +25,16 @@ export interface Drone {
   targetId: string | null;
   waypoints: Vector2D[];
   currentWaypointIndex: number;
-  flightTime: number;
-  maxFlightTime: number;
+  battery: number;
+}
+
+export interface AttackDrone {
+  id: string;
+  pos: Vector2D;
+  speed: number;
+  heading: number;
+  state: 'INTERCEPTING' | 'RETURNING';
+  targetId: string | null;
 }
 
 export interface LogEntry {
@@ -40,6 +49,7 @@ export interface SimulationStats {
   enemy: number;
   fishing: number;
   unknown: number;
+  weather: WeatherType;
 }
 
 export const distance = (p1: Vector2D, p2: Vector2D) => {

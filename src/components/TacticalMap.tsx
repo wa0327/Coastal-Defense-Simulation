@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
-import { Target, Drone, TargetType, LogEntry, SimulationStats, distance, normalize, angleDiff } from '../lib/simulation';
+import { Target, Drone, AttackDrone, TargetType, WeatherType, LogEntry, SimulationStats, distance, normalize, angleDiff } from '../lib/simulation';
+import { playLockSound, playExplosionSound } from '../lib/audio';
 
 interface Props {
   onLog: (log: LogEntry) => void;
@@ -21,12 +22,30 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
     let lastTime = 0;
 
     let targets: Target[] = [];
+    let attackDrones: AttackDrone[] = [];
+    let trackedDurations: Record<string, number> = {};
+    let lockedTargets: Set<string> = new Set();
     const BASE_POS = { x: 80, y: 300 };
+    
+    let currentWeather: WeatherType = 'CLEAR';
+    let lastWeatherChange = 0;
+    const weatherTypes: WeatherType[] = ['CLEAR', 'FOG', 'RAIN', 'STORM'];
+    let rainParticles: {x: number, y: number, speed: number, length: number}[] = [];
+    
+    // Initialize rain particles
+    for (let i = 0; i < 200; i++) {
+      rainParticles.push({
+        x: Math.random() * 900,
+        y: Math.random() * 800,
+        speed: 15 + Math.random() * 10,
+        length: 10 + Math.random() * 20
+      });
+    }
     
     // Define 4 distinct patrol sectors
     const patrolSectors = [
-      [{x: 250, y: 100}, {x: 700, y: 100}, {x: 700, y: 250}, {x: 250, y: 250}], // Top
-      [{x: 250, y: 350}, {x: 700, y: 350}, {x: 700, y: 500}, {x: 250, y: 500}], // Bottom
+      [{x: 250, y: 100}, {x: 800, y: 100}, {x: 800, y: 250}, {x: 250, y: 250}], // Top
+      [{x: 250, y: 550}, {x: 800, y: 550}, {x: 800, y: 700}, {x: 250, y: 700}], // Bottom
     ];
 
     let drones: Drone[] = Array.from({ length: 4 }).map((_, i) => ({
@@ -39,13 +58,12 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
       targetId: null,
       waypoints: patrolSectors[i % 2],
       currentWaypointIndex: 0,
-      flightTime: 0,
-      maxFlightTime: 180000,
+      battery: 100,
     }));
 
     const spawnTarget = () => {
       const types: TargetType[] = ['FRIENDLY', 'ENEMY', 'FISHING', 'UNKNOWN'];
-      const weights = [0.35, 0.35, 0.2, 0.1];
+      const weights = [0.3, 0.45, 0.2, 0.05];
       const rand = Math.random() * 1.5;
       let sum = 0;
       let selectedType: TargetType = 'FISHING';
@@ -97,6 +115,62 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
       
       const speedMult = dt * 0.01;
 
+      // Weather change logic
+      if (time - lastWeatherChange > 30000) { // Change weather every 30 seconds
+        if (Math.random() > 0.5) {
+          const newWeather = weatherTypes[Math.floor(Math.random() * weatherTypes.length)];
+          if (newWeather !== currentWeather) {
+            currentWeather = newWeather;
+            onLog({
+              id: Math.random().toString(),
+              time: new Date(),
+              message: `[氣象] 天候狀況改變：${
+                currentWeather === 'CLEAR' ? '晴朗' :
+                currentWeather === 'FOG' ? '濃霧' :
+                currentWeather === 'RAIN' ? '降雨' : '暴風雨'
+              }`,
+              type: currentWeather === 'STORM' ? 'WARNING' : 'INFO'
+            });
+          }
+        }
+        lastWeatherChange = time;
+      }
+
+      // Update rain particles
+      if (currentWeather === 'RAIN' || currentWeather === 'STORM') {
+        const speedBoost = currentWeather === 'STORM' ? 1.5 : 1;
+        rainParticles.forEach(p => {
+          p.y += p.speed * speedBoost;
+          p.x -= p.speed * 0.2 * speedBoost; // Wind effect
+          if (p.y > canvas.height) {
+            p.y = -20;
+            p.x = Math.random() * (canvas.width + 200);
+          }
+        });
+      }
+
+      // Weather effects
+      let weatherSpeedMult = 1.0;
+      let weatherBatteryDrain = 1.0;
+      let weatherDetectionRange = 200;
+
+      switch (currentWeather) {
+        case 'FOG':
+          weatherSpeedMult = 0.8;
+          weatherDetectionRange = 130;
+          break;
+        case 'RAIN':
+          weatherSpeedMult = 0.9;
+          weatherBatteryDrain = 1.2;
+          weatherDetectionRange = 160;
+          break;
+        case 'STORM':
+          weatherSpeedMult = 0.6;
+          weatherBatteryDrain = 2.0;
+          weatherDetectionRange = 100;
+          break;
+      }
+
       // Spawn logic
       if (time - lastSpawnTime > 2000) { // Spawn every 2 seconds
         if (targets.length < 12 && Math.random() > 0.3) {
@@ -128,38 +202,55 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
       }
 
       // Update Drones
-      let activeCount = drones.filter(d => d.state !== 'IDLE').length;
-
       drones.forEach(drone => {
         if (drone.state === 'IDLE') {
-          // Recharge (assume 1.5x speed recharge)
-          drone.flightTime = Math.max(0, drone.flightTime - dt * 1.5);
+          // Recharge (15% per second)
+          drone.battery = Math.min(100, drone.battery + 15 * (dt / 1000));
           
           // Launch if needed
-          if (activeCount < 2 && drone.flightTime === 0) {
+          const isSectorCovered = drones.some(d => 
+            d !== drone && 
+            d.waypoints === drone.waypoints && 
+            (d.state === 'PATROL' || d.state === 'TRACKING')
+          );
+
+          if (!isSectorCovered && drone.battery >= 95) {
             drone.state = 'PATROL';
-            activeCount++;
             onLog({
               id: Math.random().toString(),
               time: new Date(),
-              message: `[調度] ${drone.id} 起飛執行巡邏任務。`,
+              message: `[調度] ${drone.id} 電池已充飽，升空接替巡邏任務。`,
               type: 'INFO'
             });
           }
         } else {
-          drone.flightTime += dt;
+          // Battery drain logic
+          let drainRate = 0.5; // PATROL (5% per 10s -> 200s total)
+          if (drone.state === 'TRACKING') drainRate = 1.5; // TRACKING (15% per 10s -> ~66s total)
+          if (drone.state === 'RETURNING') drainRate = 0.8; // RETURNING (8% per 10s -> 125s total)
           
-          const distToBase = distance(drone.pos, BASE_POS);
-          // Max return speed is 10 m/s. Speed in pixels per ms = 10 * 0.01 = 0.1 pixels/ms
-          const timeToReturn = distToBase / 0.1;
+          drainRate *= weatherBatteryDrain;
           
-          if (drone.state !== 'RETURNING' && drone.flightTime + timeToReturn + 5000 > drone.maxFlightTime) {
+          drone.battery = Math.max(0, drone.battery - drainRate * (dt / 1000));
+          
+          const isLowPower = drone.battery < 20;
+          const speedMultiplier = (isLowPower ? 0.6 : 1.0) * weatherSpeedMult;
+          const turnMultiplier = (isLowPower ? 0.5 : 1.0) * weatherSpeedMult;
+
+          const returnSpeed = 10.0 * speedMultiplier;
+          // Calculate time to return in seconds (assuming 60fps, speedMult = dt*0.01)
+          // Speed in pixels per second = speed * 100 * 0.01 = speed
+          // Wait, speedMult = dt * 0.01. So distance per second = speed * (1000 * 0.01) = speed * 10
+          const timeToReturnSec = distance(drone.pos, BASE_POS) / (returnSpeed * 10);
+          const batteryNeeded = timeToReturnSec * 0.8; // 0.8 is the return drain rate
+
+          if (drone.state !== 'RETURNING' && (drone.battery < batteryNeeded + 5 || drone.battery <= 15)) {
             drone.state = 'RETURNING';
             drone.targetId = null;
             onLog({
               id: Math.random().toString(),
               time: new Date(),
-              message: `[調度] ${drone.id} 巡航時間即將達標，正在返航。`,
+              message: `[電量警告] ${drone.id} 電量過低 (${drone.battery.toFixed(1)}%)，進入節能模式並強制返航。`,
               type: 'WARNING'
             });
           }
@@ -167,8 +258,8 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
           if (drone.state === 'RETURNING') {
             const desiredHeading = Math.atan2(BASE_POS.y - drone.pos.y, BASE_POS.x - drone.pos.x);
             const diff = angleDiff(drone.heading, desiredHeading);
-            drone.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.05);
-            drone.speed = 10.0; // Max speed for return
+            drone.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.05 * turnMultiplier);
+            drone.speed = returnSpeed; // Max speed for return, reduced if low power
             
             drone.pos.x += Math.cos(drone.heading) * drone.speed * speedMult;
             drone.pos.y += Math.sin(drone.heading) * drone.speed * speedMult;
@@ -178,7 +269,6 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
               drone.pos.x = BASE_POS.x;
               drone.pos.y = BASE_POS.y + (parseInt(drone.id.split('-')[1]) - 1.5) * 20;
               drone.heading = 0;
-              activeCount--;
               onLog({
                 id: Math.random().toString(),
                 time: new Date(),
@@ -196,15 +286,15 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
 
             const desiredHeading = Math.atan2(targetPos.y - drone.pos.y, targetPos.x - drone.pos.x);
             const diff = angleDiff(drone.heading, desiredHeading);
-            drone.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.04);
-            drone.speed = 5.0; // Patrol speed
+            drone.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.04 * turnMultiplier);
+            drone.speed = 5.0 * speedMultiplier; // Patrol speed
 
             drone.pos.x += Math.cos(drone.heading) * drone.speed * speedMult;
             drone.pos.y += Math.sin(drone.heading) * drone.speed * speedMult;
 
             // Check for enemies
             for (const t of targets) {
-              if (t.type === 'ENEMY' && distance(drone.pos, t.pos) < 200) {
+              if (t.type === 'ENEMY' && distance(drone.pos, t.pos) < weatherDetectionRange) {
                 const isTracked = drones.some(d => d.targetId === t.id);
                 if (!isTracked) {
                   drone.state = 'TRACKING';
@@ -231,15 +321,15 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
               }
               
               const diff = angleDiff(drone.heading, desiredHeading);
-              drone.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.06);
-              drone.speed = target.speed; // Match target speed
+              drone.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.06 * turnMultiplier);
+              drone.speed = target.speed * speedMultiplier; // Match target speed
               
               drone.pos.x += Math.cos(drone.heading) * drone.speed * speedMult;
               drone.pos.y += Math.sin(drone.heading) * drone.speed * speedMult;
 
               // Share intelligence: check for other enemies in range while tracking
               for (const t of targets) {
-                if (t.type === 'ENEMY' && t.id !== target.id && distance(drone.pos, t.pos) < 200) {
+                if (t.type === 'ENEMY' && t.id !== target.id && distance(drone.pos, t.pos) < weatherDetectionRange) {
                   const isTracked = drones.some(d => d.targetId === t.id);
                   if (!isTracked) {
                     // Find an available drone to track this new target
@@ -259,7 +349,7 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
               }
 
               // Check if target is out of range of ALL drones
-              const isTargetVisible = drones.some(d => distance(d.pos, target.pos) < 200);
+              const isTargetVisible = drones.some(d => distance(d.pos, target.pos) < weatherDetectionRange);
               if (!isTargetVisible) {
                 drone.state = 'PATROL';
                 drone.targetId = null;
@@ -284,9 +374,118 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
         }
       });
 
+      // Track durations
+      const currentlyTracked = new Set<string>();
+      drones.forEach(d => {
+        if (d.state === 'TRACKING' && d.targetId) {
+          currentlyTracked.add(d.targetId);
+        }
+      });
+
+      currentlyTracked.forEach(id => {
+        if (!trackedDurations[id]) trackedDurations[id] = 0;
+        trackedDurations[id] += dt;
+
+        if (trackedDurations[id] > 1000 && !lockedTargets.has(id)) {
+          lockedTargets.add(id);
+          playLockSound();
+          // Launch attack drone
+          attackDrones.push({
+            id: `ATK-${Math.random().toString(36).substring(7)}`,
+            pos: { x: BASE_POS.x, y: BASE_POS.y },
+            speed: 15, // fast
+            heading: 0,
+            state: 'INTERCEPTING',
+            targetId: id
+          });
+          onLog({
+            id: Math.random().toString(),
+            time: new Date(),
+            message: `[攻擊] 目標已鎖定，發射攻擊型無人機進行攔截！`,
+            type: 'ALERT'
+          });
+        }
+      });
+
+      // Remove untracked from durations
+      Object.keys(trackedDurations).forEach(id => {
+        if (!currentlyTracked.has(id)) {
+          delete trackedDurations[id];
+          lockedTargets.delete(id);
+        }
+      });
+
+      // Update Attack Drones
+      for (let i = attackDrones.length - 1; i >= 0; i--) {
+        const ad = attackDrones[i];
+        
+        if (ad.state === 'INTERCEPTING') {
+          const target = targets.find(t => t.id === ad.targetId);
+          const isStillTracked = currentlyTracked.has(ad.targetId!);
+          
+          if (target && isStillTracked) {
+            // Predict position
+            const dist = distance(ad.pos, target.pos);
+            const timeToIntercept = dist / (ad.speed * speedMult); // frames
+            
+            const predictedPos = {
+              x: target.pos.x + target.vel.x * target.speed * speedMult * timeToIntercept,
+              y: target.pos.y + target.vel.y * target.speed * speedMult * timeToIntercept
+            };
+            
+            const desiredHeading = Math.atan2(predictedPos.y - ad.pos.y, predictedPos.x - ad.pos.x);
+            const diff = angleDiff(ad.heading, desiredHeading);
+            ad.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.1); // fast turn
+            
+            ad.pos.x += Math.cos(ad.heading) * ad.speed * speedMult;
+            ad.pos.y += Math.sin(ad.heading) * ad.speed * speedMult;
+            
+            // Collision check
+            if (distance(ad.pos, target.pos) < 15) {
+              playExplosionSound();
+              onLog({
+                id: Math.random().toString(),
+                time: new Date(),
+                message: `[擊毀] 攻擊型無人機成功命中目標！`,
+                type: 'ALERT'
+              });
+              // Remove target
+              const tIndex = targets.findIndex(t => t.id === ad.targetId);
+              if (tIndex !== -1) targets.splice(tIndex, 1);
+              // Remove attack drone
+              attackDrones.splice(i, 1);
+              continue;
+            }
+          } else {
+            // Target lost or destroyed, return to base
+            if (ad.state !== 'RETURNING') {
+              ad.state = 'RETURNING';
+              ad.targetId = null;
+              onLog({
+                id: Math.random().toString(),
+                time: new Date(),
+                message: `[資訊] 目標已脫離鎖定，攻擊型無人機 ${ad.id} 撤回基地。`,
+                type: 'INFO'
+              });
+            }
+          }
+        } else if (ad.state === 'RETURNING') {
+          const desiredHeading = Math.atan2(BASE_POS.y - ad.pos.y, BASE_POS.x - ad.pos.x);
+          const diff = angleDiff(ad.heading, desiredHeading);
+          ad.heading += Math.sign(diff) * Math.min(Math.abs(diff), 0.1);
+          
+          ad.pos.x += Math.cos(ad.heading) * ad.speed * speedMult;
+          ad.pos.y += Math.sin(ad.heading) * ad.speed * speedMult;
+          
+          if (distance(ad.pos, BASE_POS) < 10) {
+            attackDrones.splice(i, 1);
+          }
+        }
+      }
+
       // Update stats every 500ms
       if (time - lastStatsTime > 500) {
-        const stats = { friendly: 0, enemy: 0, fishing: 0, unknown: 0 };
+        const stats = { friendly: 0, enemy: 0, fishing: 0, unknown: 0, weather: currentWeather };
         targets.forEach(t => {
           if (t.type === 'FRIENDLY') stats.friendly++;
           if (t.type === 'ENEMY') stats.enemy++;
@@ -302,6 +501,20 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
       // Clear
       ctx.fillStyle = '#020617'; // slate-950
       ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Draw Weather Overlay (Base)
+      if (currentWeather === 'FOG') {
+        ctx.fillStyle = 'rgba(241, 245, 249, 0.15)'; // slate-100
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      } else if (currentWeather === 'STORM') {
+        ctx.fillStyle = 'rgba(2, 6, 23, 0.4)'; // slate-950
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        // Lightning flashes
+        if (Math.random() > 0.98) {
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+      }
 
       // Draw Coastline
       ctx.fillStyle = '#064e3b'; // emerald-900
@@ -346,10 +559,15 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
       ctx.fillText('BASE', BASE_POS.x - 12, BASE_POS.y - 45);
 
       // Draw Drone Detection Radius
+      let weatherDetectionRange = 200;
+      if (currentWeather === 'FOG') weatherDetectionRange = 130;
+      if (currentWeather === 'RAIN') weatherDetectionRange = 160;
+      if (currentWeather === 'STORM') weatherDetectionRange = 100;
+
       drones.forEach(drone => {
         if (drone.state !== 'IDLE' && drone.state !== 'RETURNING') {
           ctx.beginPath();
-          ctx.arc(drone.pos.x, drone.pos.y, 200, 0, Math.PI * 2);
+          ctx.arc(drone.pos.x, drone.pos.y, weatherDetectionRange, 0, Math.PI * 2);
           ctx.fillStyle = drone.state === 'TRACKING' ? 'rgba(239, 68, 68, 0.05)' : 'rgba(56, 189, 248, 0.05)';
           ctx.fill();
           ctx.strokeStyle = drone.state === 'TRACKING' ? 'rgba(239, 68, 68, 0.3)' : 'rgba(56, 189, 248, 0.3)';
@@ -432,7 +650,8 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
         // Drone label
         ctx.fillStyle = drone.state === 'IDLE' ? '#94a3b8' : '#bae6fd';
         ctx.font = '10px monospace';
-        ctx.fillText(drone.id, drone.pos.x + 12, drone.pos.y + 4);
+        const batteryPct = drone.battery;
+        ctx.fillText(`${drone.id} [${batteryPct.toFixed(0)}%]`, drone.pos.x + 12, drone.pos.y + 4);
         
         if (drone.state === 'TRACKING') {
            ctx.fillStyle = '#fca5a5';
@@ -440,13 +659,54 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
         } else if (drone.state === 'RETURNING') {
            ctx.fillStyle = '#fde047';
            ctx.fillText('[RETURNING]', drone.pos.x + 12, drone.pos.y + 16);
-        } else if (drone.state !== 'IDLE') {
-           // Show battery
-           const batteryPct = Math.max(0, 100 - (drone.flightTime / drone.maxFlightTime) * 100);
-           ctx.fillStyle = batteryPct > 20 ? '#86efac' : '#fca5a5';
-           ctx.fillText(`[${batteryPct.toFixed(0)}%]`, drone.pos.x + 12, drone.pos.y + 16);
+        } else if (drone.state === 'IDLE') {
+           ctx.fillStyle = '#86efac';
+           ctx.fillText(batteryPct >= 95 ? '[STANDBY]' : '[CHARGING]', drone.pos.x + 12, drone.pos.y + 16);
+        } else {
+           ctx.fillStyle = '#86efac';
+           ctx.fillText('[PATROL]', drone.pos.x + 12, drone.pos.y + 16);
+        }
+
+        if (drone.state !== 'IDLE' && batteryPct < 20) {
+           ctx.fillStyle = '#ef4444';
+           ctx.fillText('LOW PWR', drone.pos.x + 12, drone.pos.y + 26);
         }
       });
+      // Draw Attack Drones
+      attackDrones.forEach(ad => {
+        ctx.save();
+        ctx.translate(ad.pos.x, ad.pos.y);
+        ctx.rotate(ad.heading);
+        
+        ctx.fillStyle = '#f97316'; // orange-500
+        ctx.beginPath();
+        ctx.moveTo(8, 0);
+        ctx.lineTo(-6, 4);
+        ctx.lineTo(-6, -4);
+        ctx.fill();
+        
+        ctx.restore();
+        
+        // Trail
+        ctx.beginPath();
+        ctx.moveTo(ad.pos.x - Math.cos(ad.heading) * 10, ad.pos.y - Math.sin(ad.heading) * 10);
+        ctx.lineTo(ad.pos.x - Math.cos(ad.heading) * 20, ad.pos.y - Math.sin(ad.heading) * 20);
+        ctx.strokeStyle = 'rgba(249, 115, 22, 0.5)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      });
+
+      // Draw Weather Particles (Top layer)
+      if (currentWeather === 'RAIN' || currentWeather === 'STORM') {
+        ctx.strokeStyle = currentWeather === 'STORM' ? 'rgba(148, 163, 184, 0.6)' : 'rgba(148, 163, 184, 0.3)'; // slate-400
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        rainParticles.forEach(p => {
+          ctx.moveTo(p.x, p.y);
+          ctx.lineTo(p.x - p.length * 0.2, p.y + p.length);
+        });
+        ctx.stroke();
+      }
     };
 
     const loop = (time: number) => {
@@ -465,8 +725,8 @@ export default function TacticalMap({ onLog, onStatsUpdate }: Props) {
   return (
     <canvas
       ref={canvasRef}
-      width={800}
-      height={600}
+      width={900}
+      height={800}
       className="w-full h-full object-contain bg-slate-950 rounded-lg border border-slate-800 shadow-2xl"
     />
   );
